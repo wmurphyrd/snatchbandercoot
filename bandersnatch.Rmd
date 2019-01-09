@@ -1,0 +1,304 @@
+---
+title: "bandersnatch"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(magrittr)
+library(jsonlite)
+library(tidyverse)
+```
+
+```{r}
+b <- readLines("bandersnatch.json") %>% fromJSON
+```
+
+```{r}
+choice_points <- b$interactiveVideoMoments$choicePointNavigatorMetadata$choicePointsMetadata$choicePoints
+lapply(names(choice_points), function (choice_id) {
+  choice <- choice_points[[choice_id]]
+  tibble(id = choice_id, text = choice$description,
+         choices =  list(choice$choices))
+}) %>%
+  bind_rows() ->
+  choice_points
+choice_points
+```
+
+```{r}
+b2 <- readLines("bandersnatch.json") %>% fromJSON(simplifyDataFrame = FALSE)
+moments <- b$interactiveVideoMoments$momentsBySegment
+mean(names(moments) %in% choice_points$id)
+mean(choice_points$id %in% names(moments))
+
+moments_choices <- lapply(names(moments), function (moment_id) {
+  # if (moment_id == "2G") {
+  #   browser()
+  # }
+  moment <- jsonlite::flatten(moments[[moment_id]])
+  # if ("scene:cs_bs_phone" %in% moment$type) {
+  #   browser()
+  # }
+  alters_state <- any(moment$type == "notification:playbackImpression")
+  scenes <- grepl("scene:", moment$type)
+  if (!is.null(moment$trackingInfo.optionType)) {
+    scenes <- scenes & ifelse(
+      is.na(moment$trackingInfo.optionType),
+      "",
+      moment$trackingInfo.optionType
+    ) != "fakeOption"
+  }
+
+  if (!any(scenes)) {
+    return(tibble(
+      decision_id = moment_id, start_time = moment$startMs[1],
+      end_time = moment$endMs[1], scene_type = moment$type[1],
+      alters_state = alters_state
+    ))
+  }
+  # looks like all moments with multiple scenes have only 1 true scene
+  # and one "fakeChoice" scene
+  moment <- moment[scenes, ]
+  choices <- moment$choices[[1]]
+  if (moment$type == "scene:cs_bs_phone") {
+    choices$text <- ifelse(
+      is.na(choices$code),
+      "Incorrect Code",
+      choices$code
+    )
+  }
+  choices <- choices[, intersect(names(choices), c("id", "segmentId", "sg", "text"))]
+    
+  # choices_clean <- lapply(moment$choices, function (choices) {
+  #   choices[, intersect(names(choices), c("id", "segmentId", "sg", "text"))]
+  # }) %>% bind_rows()
+  if (nrow(moment) > 1) {
+    browser()
+  }
+  choices %>% mutate(
+    decision_id = moment_id,
+    start_time = moment$startMs,
+    end_time = moment$endMs,
+    scene_type = moment$type,
+    alters_state = alters_state
+  )
+  # choices_clean
+}) %>%
+  bind_rows()
+```
+
+```{r}
+sgroups <- b$interactiveVideoMoments$segmentGroups
+doList <- function (x) {
+  if (is.character(x)) {
+    return (x)
+  }
+  if (!is.null(x$segment)) {
+    return(x$segment)
+  }
+  if (is.list(x)) {
+    return(doList(x))
+  }
+}
+sgroups <- lapply(names(sgroups), function (group_id) {
+  group <- sgroups[[group_id]]
+  if (is.character(group)) {
+    return (tibble(group_id = group_id, scene_id = group))
+  }
+  if (is.data.frame(group)) {
+    tab <- tibble(group_id = group_id, scene_id = group$segment)
+    tab$sub_group_id = group$segmentGroup
+    return(tab)
+  }
+  return(tibble(group_id = group_id, scene_id = sapply(group, doList)))
+}) %>%
+  bind_rows()
+
+
+# while(any(!is.na(sgroups$sub_group_id))) {
+#   sgroups <- sgroups %>%
+#     left_join(sgroups, by = c(sub_group_id = "group_id")) %>%
+#     transmute(
+#       scene_id = ifelse(is.na(scene_id.y), scene_id.x, scene_id.y),
+#       group_id,
+#       sub_group_id = sub_group_id.y
+#     )
+# }
+# while(any(sgroups$scene_id %in% sgroups$group_id)) {
+#   sgroups <- sgroups %>%
+#     left_join(sgroups, by = c(segmentId = "group_id")) %>%
+#     transmute(
+#       scene_id = ifelse(is.na(scene_id.y), scene_id.x, scene_id.y),
+#       group_id,
+#       sub_group_id = sub_group_id.y
+#     )
+# }
+
+sgroups <- sgroups %>% filter(!is.na(scene_id)) %>%
+  select(-sub_group_id) %>%
+  distinct() %>%
+  rename(segmentId = scene_id)
+
+```
+
+```{r}
+# original unfurling
+# group_moments <- filter(moments_choices,!is.na(sg)) %>%
+#   select(-segmentId) %>%
+#   left_join(sgroups, by = c(sg = "group_id"))
+# moments_choices_unfurled <- moments_choices %>%
+#   filter(is.na(sg)) %>%
+#   select(-sg) %>%
+#   bind_rows(group_moments) %>%
+#   distinct() %>%
+#   mutate(id = ifelse(is.na(id), id, paste0("choice_", id)))
+
+# unfurling also with non-explicit groups
+# group_moments <- moments_choices %>%
+#   mutate(segmentId = ifelse(
+#     is.na(sg), segmentId, sg
+#   )) %>%
+#   select(-sg) %>%
+#   inner_join(sgroups, by = c(segmentId = "group_id")) %>%
+#   mutate(segmentId = segmentId.y) %>%
+#   select(-segmentId.y)
+# moments_choices_unfurled <- moments_choices %>%
+#   filter(!id %in% group_moments$id) %>%
+#   select(-sg) %>%
+#   bind_rows(group_moments) %>%
+#   distinct() %>%
+#   mutate(id = ifelse(is.na(id), id, paste0("choice_", id)))
+
+# no unfurling (list groups as nodes instead)
+moments_choices_unfurled <- moments_choices %>%
+  distinct() %>%
+  mutate(
+    segmentId = ifelse(is.na(sg), segmentId, sg),
+    id = ifelse(is.na(id), id, paste0("choice_", id))
+  ) %>%
+  select(-sg)
+moments_choices_unfurled
+```
+
+```{r}
+
+dec_nodes <- moments_choices_unfurled %>%
+  filter(!is.na(id)) %>%
+  mutate(type = ifelse(
+    scene_type == "scene:interstitialPostPlay_v2",
+    "Reset Point",
+    "Decision Point"
+  )) %>%
+  select(type, id = decision_id, start_time, end_time, alters_state) %>%
+  distinct() %>%
+  left_join(select(choice_points, id, text))
+
+group_nodes <- sgroups %>%
+  select(id = group_id) %>%
+  distinct() %>%
+  mutate(type = "State Branch")
+
+choice_nodes <- moments_choices_unfurled %>%
+  filter(!is.na(id)) %>%
+  select(id, text) %>%
+  distinct() %>%
+  mutate(type = "Choice")
+nodes <- bind_rows(dec_nodes, group_nodes, choice_nodes)
+
+#various references that aren't defined 
+nodes <- moments_choices_unfurled %>%
+  filter(!decision_id %in% nodes$id) %>%
+  select(id = decision_id,  start_time, end_time, alters_state) %>%
+  distinct() %>%
+  mutate(type = "Other Scene") %>%
+  bind_rows(nodes, .)
+nodes <- moments_choices_unfurled %>%
+  filter(!is.na(segmentId),
+         !segmentId %in% nodes$id) %>%
+  select(id = segmentId) %>%
+  distinct() %>%
+  mutate(type = "Other Scene") %>%
+  bind_rows(nodes, .)
+nodes <- sgroups %>%
+  filter(!segmentId %in% nodes$id) %>%
+  select(id = segmentId) %>%
+  distinct() %>%
+  mutate(type = "Other Scene") %>%
+  bind_rows(nodes, .)
+
+nodes <- nodes %>% mutate(alters_state = factor(
+  alters_state,
+  levels = c(F, T, NA),
+  labels = c("No", "Yes", "N/A"),
+  exclude = NULL
+)) 
+  
+nodes
+```
+
+```{r}
+dec_choice_edge <- moments_choices_unfurled %>%
+  select(source = decision_id, target = id) %>%
+  distinct() %>%
+  mutate(edge_type = "decision-choice")
+
+choice_scene_edge <- moments_choices_unfurled %>%
+  select(source = id, target = segmentId) %>%
+  distinct() %>%
+  mutate(edge_type = "choice-scene")
+
+group_expand_edge <- sgroups %>%
+  select(source = group_id, target = segmentId) %>%
+  mutate(edge_type = "group")
+
+edges <- bind_rows(dec_choice_edge, choice_scene_edge,
+                   group_expand_edge) %>%
+  filter(complete.cases(.))
+edges
+```
+
+
+```{r}
+choice_edges <- choice_points %>% unnest(choices)
+choice_nodes <- select(choice_points, id, text) %>%
+  full_join(choice_edges %>% select(choices) %>% distinct %>% rename(id = choices), by = "id")
+choice_nodes <- choice_nodes %>%
+  mutate(id2 = paste(id, ifelse(is.na(text), "", text)))
+choice_edges <- choice_edges %>%
+  mutate(id = factor(id, levels = choice_nodes$id, labels = choice_nodes$id2),
+         choices = factor(choices, levels = choice_nodes$id, labels = choice_nodes$id2)) %>%
+  select(-text)
+
+# write_csv(choice_edges, "bandersnatch choices.csv")
+c(select(choice_nodes, id = id2), choice_edges) %>%
+  toJSON() %>%
+  writeLines("bandersnatch choices2.json")
+```
+
+```{r}
+sapply(moments, . %$% type) %>% unlist %>% unique
+lapply(moments, . %>% filter(type == "scene:interstitialPostPlay_v2")) %>% View
+lapply(moments, function (x) {x[x$type == "scene:interstitialPostPlay_v2", ]}) %>% `[`(., nrow(.[[1]]) > 0)
+lapply(moments, function (x) {x$type == "scene:interstitialPostPlay_v2"}) %>% str
+
+mean(moments_choices_unfurled$decision_id %in% choice_points$id)
+mean(moments_choices_unfurled$segmentId %in% moments_choices_unfurled$decision_id)
+
+select(moments_choices_unfurled, id, text) %>%
+  distinct() %$%
+  anyDuplicated(id)
+filter(nodes, duplicated(id))
+filter(edges, !edges$source %in% nodes$id)
+filter(edges, !edges$target %in% nodes$id)
+```
+
+```{r}
+c(
+  rename(nodes, `Event Type` = type, `Game State Changed` = alters_state),
+  edges
+) %>%
+  toJSON(na = "null", null = "null") %>%
+  writeLines("bandersnatch choices3.json")
+```
+
